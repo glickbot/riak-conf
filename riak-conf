@@ -27,12 +27,10 @@ riak-conf - The Riak Configuration Editor
 
     Easily parse and modify riak's app.config from the command line.
 
-=cut
-
 =head1 SYNOPSIS
 
     $ riak-conf [ options ] <command> [arguments]
-    
+
 =head2 OPTIONS
     
     -c --config <file>  Specify configuration file location to <file>.
@@ -58,6 +56,62 @@ riak-conf - The Riak Configuration Editor
     modify   Change the values of a parameter
     search   List parameters that contain a given string
     help     Display help for commands
+
+=head2 EXAMPLES
+
+    $ riak-conf
+    
+        riak_api.pb_ip: "127.0.0.1"
+        riak_api.pb_port: 8081
+        riak_core.ring_state_dir: "./data/ring"
+        ...
+
+    $ riak-conf search http
+    
+        riak_core.http.[1]: "127.0.0.1" 8091
+        riak_kv.http_url_encoding: on
+
+    $ riak-conf add riak_core.http 192.168.0.2 8098
+    
+        [24/Aug/2012:10:27:23 -0700] INPUT: Coerced 192.168.0.2 into "192.168.0.2"
+        [24/Aug/2012:10:27:23 -0700] SAVING: Changes to ../etc/app.config:
+        [24/Aug/2012:10:27:23 -0700] DIFF: ---begin diff---
+        36c36,37
+        <               {http, [ {"127.0.0.1", 8091 } 
+        ---
+        >               {http, [ {"127.0.0.1", 8091 }, 
+        >                       {"192.168.0.2", 8098} 
+        [24/Aug/2012:10:27:23 -0700] DIFF: ---end diff---
+        [24/Aug/2012:10:27:23 -0700] SAVING: Changes saved.
+
+    $ riak-conf list riak_core.http
+        
+        riak_core.http.[1]: "127.0.0.1" 8091
+        riak_core.http.[2]: "192.168.0.2" 8098
+
+    $ riak-conf riak_core.http.[2] _ 8099
+
+        [24/Aug/2012:10:31:14 -0700] SAVING: Changes to ../etc/app.config:
+        [24/Aug/2012:10:31:14 -0700] DIFF: ---begin diff---
+        37c37
+        <                       {"192.168.0.2", 8098} 
+        ---
+        >                       {"192.168.0.2", 8099} 
+        [24/Aug/2012:10:31:14 -0700] DIFF: ---end diff---
+        [24/Aug/2012:10:31:14 -0700] SAVING: Changes saved.
+
+    $ riak-conf remove riak_core.http.[1]
+
+        [24/Aug/2012:10:32:09 -0700] SAVING: Changes to ../etc/app.config:
+        [24/Aug/2012:10:32:09 -0700] DIFF: ---begin diff---
+        36c36
+        <               {http, [ {"127.0.0.1", 8091 }, 
+        ---
+        >               {http, [  
+        [24/Aug/2012:10:32:09 -0700] DIFF: ---end diff---
+        [24/Aug/2012:10:32:09 -0700] SAVING: Changes saved.
+    
+
 
 =cut
 
@@ -174,7 +228,7 @@ while ( length($config) > 0 ){
         if ( $config =~ s/$qr->[1]// ){
             my $type = $qr->[0];
             $current_line++ if $type eq 'newline';
-            #              DATA, TYPE,      LINE,      POS,    LEN,    META
+            #             DATA, TYPE,      LINE,      POS,    LEN,    META
             push @tokens, [ $&, $type, $current_line, $pos, length($&), {} ];
             $pos += $+[0];
 
@@ -204,11 +258,10 @@ if ( $OPT{write} ){
 
         my $target = $OPT{config};
         $target = $OPT{output} if $OPT{output};
-        logger(INFO,'saving', "Changes to $target:");
         print_diff($target, $output) if INFO >= $OPT{log};
         open(TARGET, ">$target") or die "Unable to open $target:$!\n";
         print TARGET $output;
-        logger(INFO,'saving', "Changes saved.\n");
+        logger(INFO,'saving', "Changes saved to $OPT{config}.\n");
     
     }
 }
@@ -216,12 +269,12 @@ if ( $OPT{write} ){
 sub print_diff {
     my $file = shift;
     my $output = shift;
-    logger(INFO, 'diff', "---begin diff---");
+    logger(DEBUG, 'diff', "---begin diff---");
     open(DIFF, "| diff $file -") 
         or logger(FATAL,'output',"Unable to open diff\n");
     print DIFF $output;
     close DIFF;
-    logger(INFO, 'diff', "---end diff---");
+    logger(DEBUG, 'diff', "---end diff---");
 }
 
 # INPUT VALIDATION & COMMAND FUNCTIONS

@@ -5,10 +5,8 @@
 # SYNOPSIS
 
     $ riak-conf [ options ] <command> [arguments]
-    
 
 ## OPTIONS
-    
 
     -c --config <file>  Specify configuration file location to <file>.
     -o --output <file>  Specify save location, or use "-" for stdout.
@@ -24,7 +22,6 @@
 
 ## COMMAND OVERVIEW
     
-
     Use riak-conf help <command> for more details on each
     
 
@@ -35,6 +32,60 @@
     modify   Change the values of a parameter
     search   List parameters that contain a given string
     help     Display help for commands
+
+## EXAMPLES
+
+    $ riak-conf
+
+        riak_api.pb_ip: "127.0.0.1"
+        riak_api.pb_port: 8081
+        riak_core.ring_state_dir: "./data/ring"
+        ...
+
+    $ riak-conf search http
+    
+        riak_core.http.[1]: "127.0.0.1" 8091
+        riak_kv.http_url_encoding: on
+
+    $ riak-conf add riak_core.http 192.168.0.2 8098
+    
+        [24/Aug/2012:10:27:23 -0700] INPUT: Coerced 192.168.0.2 into "192.168.0.2"
+        [24/Aug/2012:10:27:23 -0700] SAVING: Changes to ../etc/app.config:
+        [24/Aug/2012:10:27:23 -0700] DIFF: ---begin diff---
+        36c36,37
+        <               {http, [ {"127.0.0.1", 8091 } 
+        ---
+        >               {http, [ {"127.0.0.1", 8091 }, 
+        >                       {"192.168.0.2", 8098} 
+        [24/Aug/2012:10:27:23 -0700] DIFF: ---end diff---
+        [24/Aug/2012:10:27:23 -0700] SAVING: Changes saved.
+
+    $ riak-conf list riak_core.http
+        
+        riak_core.http.[1]: "127.0.0.1" 8091
+        riak_core.http.[2]: "192.168.0.2" 8098
+
+    $ riak-conf riak_core.http.[2] _ 8099
+
+        [24/Aug/2012:10:31:14 -0700] SAVING: Changes to ../etc/app.config:
+        [24/Aug/2012:10:31:14 -0700] DIFF: ---begin diff---
+        37c37
+        <                       {"192.168.0.2", 8098} 
+        ---
+        >                       {"192.168.0.2", 8099} 
+        [24/Aug/2012:10:31:14 -0700] DIFF: ---end diff---
+        [24/Aug/2012:10:31:14 -0700] SAVING: Changes saved.
+
+    $ riak-conf remove riak_core.http.[1]
+
+        [24/Aug/2012:10:32:09 -0700] SAVING: Changes to ../etc/app.config:
+        [24/Aug/2012:10:32:09 -0700] DIFF: ---begin diff---
+        36c36
+        <               {http, [ {"127.0.0.1", 8091 }, 
+        ---
+        >               {http, [  
+        [24/Aug/2012:10:32:09 -0700] DIFF: ---end diff---
+        [24/Aug/2012:10:32:09 -0700] SAVING: Changes saved.
 
 # COMMANDS
 
