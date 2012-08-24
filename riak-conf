@@ -1,0 +1,778 @@
+#!/usr/bin/perl
+# -------------------------------------------------------------------
+# riak-conf: A configuration editor for riak erlang configuration files
+#
+# Copyright (c) 2007-2012 Basho Technologies, Inc.  All Rights Reserved.
+#
+# This file is provided to you under the Apache License,
+# Version 2.0 (the "License"); you may not use this file
+# except in compliance with the License.  You may obtain
+# a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+# -------------------------------------------------------------------
+=head1 NAME
+
+riak-conf - The Riak Configuration Editor
+
+=head1 DESCRIPTION
+
+    Easily parse and modify riak's app.config from the command line.
+
+=cut
+
+=head1 SYNOPSIS
+
+    $ riak-conf [ options ] <command> [arguments]
+    
+=head2 OPTIONS
+    
+    -c --config <file>  Specify configuration file location to <file>.
+    -o --output <file>  Specify save location, or use "-" for stdout.
+    -a --all            When listing/searching, show all tuples.
+    -n --numbers        Add line numbers to list/search output.
+    -f --force          Force, used to overide value type check for modify.
+    -d --debug          Set log level to debug.
+    -q --quiet          Set log level to suppress usual output.
+    --log --loglevel N  Set log level manually to N.
+    --diff              Shortcut to display what would be changed.
+    --help              Print this help page.
+    --man               Prin more verbose help.
+
+=head2 COMMAND OVERVIEW
+    
+    Use riak-conf help <command> for more details on each
+    
+    list     List parameters and values
+    get      Get value of specific parameter
+    add      Add new parameter
+    remove   Remove entire parameter
+    modify   Change the values of a parameter
+    search   List parameters that contain a given string
+    help     Display help for commands
+
+=cut
+
+use strict;
+use warnings;
+use POSIX qw(strftime);
+use IO::Handle;
+use Getopt::Long;
+use Pod::Usage;
+use Data::Dumper;
+
+use constant { 
+    DATA => 0, TYPE => 1, LINE => 2, POS =>  3, LEN =>  4, META => 5,
+};
+use constant {
+    DEBUG => 1, INFO => 2, WARN => 4, FATAL => 5,
+};
+
+my $default_cmd = 'list';
+my @default_args = ();
+
+my %OPT = (
+    config => "../etc/app.config",
+    write => 0,
+    log => INFO,
+    tuple_matches => 0,
+    numbers => 0,
+);
+
+GetOptions(\%OPT,
+    'all|a',
+    'numbers|n',
+    'debug|d',
+    'quiet|q',
+    'log|loglevel',
+    'diff',
+    'force|f',
+    'config|file=s',
+    'output|o=s',
+    'help|h',
+    'man',
+    ) or pod2usage(2);
+
+pod2usage(1) if $OPT{help};
+pod2usage(-exitstatus => 0, -verbose => 2 ) if $OPT{man};
+
+$OPT{log} = 0 if $OPT{debug};
+$OPT{log} = 6 if $OPT{quiet};
+
+my %commands = (
+    'list' =>       { fun => \&list_tuple, max_args => 1, loose_end => 1 },
+    'get' =>        { fun => \&get_value, min_args => 1 },
+    'add' =>        { fun => \&add_tuple, min_args => 2 },
+    'remove' =>     { fun => \&remove_tuple, min_args => 2, max_args => 2,
+                      split => 1 },
+    'modify' =>     { fun => \&modify_tuple, min_args => 1 },
+    'search' =>     { fun => \&list_tuple, max_args => 1, min_args => 1,
+                      loose_end => 1, loose_begin => 1 },
+    'help' =>       { fun => \&command_help, max_args => 1 },
+);
+
+( 
+    $OPT{cmd}, $OPT{tuple_name}, $OPT{tuple_regex}, $OPT{args} 
+) = validate_cmd(@ARGV);
+
+my @token_actions = (
+    [ 'comment',    qr/^%.*/,                     \&handle_default ],
+    [ 'space',      qr/^[^\S\n]+/,                \&handle_default ],
+    [ 'comma',      qr/^,/,                       \&handle_comma ],
+    [ 'begin_list', qr/^\[/,                      \&handle_begin_list ],
+    [ 'end_list',   qr/^\]/,                      \&handle_end_list ],
+    [ 'begin_tuple',qr/^\{/,                      \&handle_begin_tuple ],
+    [ 'end_tuple',  qr/^\}/,                      \&handle_end_tuple ],
+    [ 'atom',       qr/^[a-z][0-9a-zA-Z_@]*/,     \&handle_item ],
+    [ 'atom',       qr/^'(?:[^'\\]|\\.)*'/,       \&handle_item ],
+    [ 'num',        qr/^[0-9][0-9]*\.?[0-9]*/,    \&handle_item ],
+    [ 'text',       qr/^"(?:[^"\\]|\\.)*"/,       \&handle_item ],
+    [ 'end_root',   qr/^\./,                      \&handle_end_root ],
+    [ 'newline',    qr!^\n!,                      \&handle_default ],
+);
+
+my @tokens = (
+    
+    [ '', 'root', 0, 0, 0, {
+        'children' => [],
+        'name' => 'root',
+        'has_items' => 0,
+        'type' => 'root',
+        values => [],
+        } ]
+    
+    ); #ALL THE THINGS
+
+my @b = ( 0 ); # current branch
+
+# READ CONFIG
+######################
+
+my $config;
+{
+    local $/;
+    open CONFIG, "<$OPT{config}" or die "Unable to open $OPT{config}: $!\n";
+    $config = <CONFIG>;
+    close CONFIG;
+}
+
+# TOKENIZE
+########################
+my $pos = 0;
+my $current_line = 1;
+while ( length($config) > 0 ){
+    my $pos_check = $pos;
+    foreach my $qr (@token_actions){
+        if ( $config =~ s/$qr->[1]// ){
+            my $type = $qr->[0];
+            $current_line++ if $type eq 'newline';
+            #              DATA, TYPE,      LINE,      POS,    LEN,    META
+            push @tokens, [ $&, $type, $current_line, $pos, length($&), {} ];
+            $pos += $+[0];
+
+            &{$qr->[2]};
+            last;
+        }
+    }
+    
+    die "\nUnexpected syntax on line $current_line in ".
+        quotemeta(substr($config, 14))."\n" if $pos_check == $pos;
+}
+
+# SAVE
+#####################
+
+if ( $OPT{write} ){
+    my $output = get_token_stream(0);
+
+    if ( $OPT{diff} ){
+        print_diff( $OPT{config}, $output );
+
+    } elsif ( $OPT{output} && $OPT{output} eq '-' ){
+
+        print $output;
+
+    } else {
+
+        my $target = $OPT{config};
+        $target = $OPT{output} if $OPT{output};
+        logger(INFO,'saving', "Changes to $target:");
+        print_diff($target, $output) if INFO >= $OPT{log};
+        open(TARGET, ">$target") or die "Unable to open $target:$!\n";
+        print TARGET $output;
+        logger(INFO,'saving', "Changes saved.\n");
+    
+    }
+}
+
+sub print_diff {
+    my $file = shift;
+    my $output = shift;
+    logger(INFO, 'diff', "---begin diff---");
+    open(DIFF, "| diff $file -") 
+        or logger(FATAL,'output',"Unable to open diff\n");
+    print DIFF $output;
+    close DIFF;
+    logger(INFO, 'diff', "---end diff---");
+}
+
+# INPUT VALIDATION & COMMAND FUNCTIONS
+#######################################
+
+sub validate_cmd {
+    my $cmd = shift;
+    if ( $cmd ){
+        if ( exists $commands{$cmd} ){
+            if ( $cmd eq 'help' ){
+                command_help(shift(@_));
+            }
+        } else {
+            # Arguments given, but none match a command
+            if ( scalar(@_) > 0 ){
+                # More than one arg given, assume it's a modify
+                unshift @_, $cmd;
+                $cmd = 'modify';
+            } else {
+                # Just one arg given, assume it's a list
+                unshift @_, $cmd;
+                $cmd = 'list';
+            }
+        }
+    } else {
+        # No commands given, use default
+        $cmd = 'list';
+    }
+    
+    if ( exists $commands{$cmd}{split} && $_[0] ){
+        my $tuple = shift;
+        if ( $tuple =~ m/^(.*)\.([^.]+?)$/){
+            unshift @_, $1, $2;
+        } else {
+            unshift @_, 'root', $tuple;
+        }
+    }
+
+    if ( $commands{$cmd}{min_args} && scalar(@_) < $commands{$cmd}{min_args} ){
+        logger(FATAL, 'input', "Too few arguments given for '$cmd'");
+    }
+
+    if ( $commands{$cmd}{max_args} && scalar(@_) > $commands{$cmd}{max_args} ){
+        logger(FATAL, 'input', "Too many arguments given for '$cmd'");
+    }
+
+    my $tuple = shift;
+
+    $tuple = "" unless $tuple;
+    my $tuple_regex;
+    if ( $commands{$cmd}{loose_begin} && $commands{$cmd}{loose_end} ){
+        $tuple_regex = qr/\Q$tuple\E/;
+    } elsif ( $commands{$cmd}{loose_begin} ){
+        $tuple_regex = qr/\Q$tuple\E$/;
+    } elsif ( $commands{$cmd}{loose_end} ){
+        $tuple_regex = qr/^\Q$tuple\E/;
+    } else {
+        $tuple_regex = qr/^\Q$tuple\E$/;
+    }
+
+    return ( $cmd, $tuple, $tuple_regex, [ @_ ] );
+}
+
+sub validate_args_for_input {
+    my @args;
+    foreach my $arg (@_){
+       if ( is_of_type($arg, 'atom') ){
+           push @args, $arg;
+       } elsif ( is_of_type($arg, 'text') ){
+           push @args, $arg;
+       } elsif ( is_of_type($arg, 'num') ){
+           push @args, $arg;
+       } elsif ( $arg =~ m/^\[\s*\]$/ ){
+           push @args, $arg;
+       } elsif ( $arg =~ m/^{\s*}$/ ){
+           push @args, $arg;
+       } elsif ( is_of_type("\"$arg\"", 'text') ){
+           logger(INFO, 'input', "Coerced $arg into \"$arg\"");
+           push @args, "\"$arg\"";
+       } else {
+           logger(FATAL, 'input',"Couldn't understand $arg as element type");
+       }
+   }
+   return @args;
+}
+
+sub is_of_type {
+    my $data = shift;
+    my $type = shift;
+    foreach my $qr (@token_actions){
+        if ( $type eq $qr->[0] ){
+            if ( $data =~ m/$qr->[1]$/ ){
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+# TOKEN EVALUATORS
+########################
+
+sub handle_default { }
+
+sub handle_comma {
+    my $comma_owner = find_last(qw( end_tuple end_list atom num text ));
+    my $current_meta = get_meta_ref($comma_owner);
+    if ( exists $$current_meta->{start} ){
+        # We have the end of a block, lets switch to the beginning
+        $current_meta = get_meta_ref($$current_meta->{start});
+    }
+    $$current_meta->{comma} = $#tokens;
+}
+
+sub handle_item {
+    my $used_in_name = 0;
+    my $current_meta = get_meta_ref($b[-1]);
+    if ( not exists $$current_meta->{name} ) {
+        if ( $tokens[$#tokens][TYPE] eq 'atom' ){
+            $$current_meta->{name} = $tokens[$#tokens][DATA];
+            $used_in_name = 1;
+        } else {
+            $$current_meta->{name} = "[".$$current_meta->{order}."]";
+        }
+    }
+
+    $$current_meta->{has_items}++ unless $used_in_name;
+    push @{$$current_meta->{values}}, $#tokens unless $used_in_name;
+
+}
+
+sub handle_begin_list {
+    handle_begin('list');
+    $tokens[$#tokens][META]->{name} = "[".$tokens[$#tokens][META]->{order}."]";
+}
+
+sub handle_begin_tuple {
+    handle_begin('tuple');
+}
+
+sub handle_begin {
+    my $type = $_[0];
+    my $current_meta = get_meta_ref($#tokens);
+    my $parent_meta =  get_meta_ref($b[-1]);
+   
+    push @{$$parent_meta->{children}}, $#tokens;
+    $$parent_meta->{has_items}++;
+    
+    $$current_meta = {
+        type => $type,
+        children => [],
+        values => [],
+        has_items => 0,
+        branch => [ @b ],
+        order => $$parent_meta->{has_items},
+        parent => $b[-1],
+    };
+    push @b, $#tokens;
+}
+
+sub handle_end_list {
+    my $id = handle_end('list');
+}
+
+sub handle_end_tuple {
+    my $id = handle_end('tuple');
+    check_if_named_list($id);
+    check_action_on($id);
+}
+
+sub handle_end_root {
+    my $id = handle_end('root');
+    check_if_named_list($id);
+    check_action_on($id);
+
+    unless ( $OPT{tuple_matches} ){
+        logger(FATAL, $OPT{cmd}, "No matches for $OPT{tuple_name}");
+    }
+}
+
+sub handle_end {
+    my $type = $_[0];
+    my $id = pop @b;
+    my $current_meta = get_meta_ref($id);
+
+    unless ( $type eq $$current_meta->{type} ){
+        die "Error: Found closing $type when ".
+            $$current_meta->{type}." expected\n";
+    }
+
+    $$current_meta->{end} = $#tokens;
+    $tokens[$#tokens][META]->{start} = $id;
+}
+
+=head1 COMMANDS
+
+=head2 HELP
+    
+    $ riak-conf help <command>
+
+        Where <command> is one of:
+            list, get, add, remove, modify, search, help
+
+=cut
+# ACTION HOOKS
+####################
+
+sub check_action_on {
+    my $id = shift;
+    my $name = get_name($id);
+    if ( $name =~ m/$OPT{tuple_regex}/ ){
+        &{$commands{$OPT{cmd}}{fun}}($id, $OPT{args});
+        $OPT{tuple_matches}++;
+    }
+}
+
+=head2 ADD
+
+    $ riak-conf add <name> <value> [<valueN> ... ]
+
+        Add <value> parameter to <name>, with optional set of <valueN>.
+        Use "root" as name to add new base parameter.
+=cut
+sub add_tuple {
+    my $id = shift;
+    my $args = shift;
+    my $name = get_name($id);
+    my $meta = get_meta_ref($id);
+    if ( $$meta->{named_list} ){
+        my $list = $$meta->{named_list};
+        my $list_meta = get_meta_ref($list);
+        my @args = validate_args_for_input(@$args);
+        if ( scalar(@args) == 1 ){
+            push @args, '[ ]';
+        }
+        my $tuple = "{".join(", ", @args)."}";
+        my @children = get_children($list);
+        if ( scalar(@children) > 0 ){
+            my $sibling_meta = get_meta_ref($children[-1]);
+            my $sibling_end = $$sibling_meta->{end};
+            append_to_token(
+                $sibling_end,
+                ", \n      "."    " x scalar(@b).$tuple
+            );
+        } else {
+            append_to_token(
+                $$meta->{named_list},
+                "\n      "."    " x scalar(@b).$tuple
+            );
+        }
+    }
+}
+=head2 REMOVE
+
+    $ riak-conf remove <name>
+
+        Completely remove the parameter with name <name>.
+=cut
+sub remove_tuple {
+    my $id = shift;
+    my $name = get_name($id);
+    my $child_to_remove = $_[0]->[0];
+    my %child_names = map { $tokens[$_][META]->{name} => $_ } get_children($id);
+    if ( exists $child_names{$child_to_remove} ){
+        set_action_on_tokens($child_names{$child_to_remove}, 'remove');
+        $OPT{write}++;
+    } else {
+        logger(FATAL,'remove',"$child_to_remove not found in $name!");
+    }
+}
+
+=head2 MODIFY
+
+    $ riak-conf [modify] <name> <value> [<valueN> ... ]
+
+        Change <name> parameter's value to <value>.
+        If parameter is multi-valued, multiple values can be listed at once.
+        The underscore (_) can be used to skip over values without changing
+        them.
+=cut
+sub modify_tuple { 
+    my $id = shift; 
+    my @args = @{shift(@_)};
+    if ( is_endpoint($id) ){
+        my $meta = get_meta_ref($id);
+        my @values = @{$$meta->{values}};
+        for ( my $arg = 0; $arg <= $#args; $arg++ ){
+            next if $args[$arg] eq '_';
+            save_arg_to_token($values[$arg], $args[$arg]);
+        }
+    }
+}
+
+=head2 LIST 
+
+    $ riak-conf list [<name>]
+    
+        List values of parameters that begin with with <name>, 
+        or all if none given.
+=cut
+sub list_tuple {
+    if ( $OPT{all} ){
+        show_all_tuples(@_);
+    } else {
+        show_endpoint_tuples(@_);
+    }
+}
+
+=head2 GET
+
+    $ riak-conf get <name> [nth] ...
+
+        Return the values of parameter <name>, 
+        and optionaly <nth> specific value.
+=cut
+sub get_value {
+    my $id = shift;
+    my $meta = get_meta_ref($id);
+    my @args = @{shift(@_)};
+    my @value_ids;
+    if ( scalar(@args) > 0 ){
+        foreach my $arg (@args){
+            if ( $arg && $arg <= scalar(@{$$meta->{values}}) ){
+                push @value_ids, $$meta->{values}->[$arg - 1];
+            }
+        }
+    } else {
+        @value_ids = @{$$meta->{values}};
+    }
+    print join("\t", map { $tokens[$_][DATA] } @value_ids)."\n";
+}
+
+
+# DISPLAY UTILITIES
+####################
+sub help {
+    my @usage;
+    push @usage, '-msg', $_[0] if $_[0];
+    my $status = $_[0] ? 1 : 0;
+    push @usage, '-exitval', $status;
+    pod2usage(@usage);
+}
+
+sub command_help {
+    my $cmd = shift;
+    my @usage = ( -exitval => 0 );
+    if ( exists $commands{$cmd} ){
+        $cmd = uc($cmd);
+        push @usage, ( -verbose => 99, -sections => [ "COMMANDS/$cmd" ] );
+    } else {
+        push @usage, ( -verbose => 99, -sections => [ "COMMANDS" ] );
+    }
+    pod2usage(@usage);
+}
+
+sub show_endpoint_tuples {
+    print get_line_display($_[0])."\n" if is_endpoint($_[0]);
+}
+
+sub show_all_tuples {
+    print get_line_display($_[0])."\n";
+}
+
+sub get_line_display {
+    my $id = shift;
+    my $line = "";
+    my $meta = get_meta_ref($id);
+    $line .= sprintf '%5s', $tokens[$id][LINE].": " if $OPT{numbers};
+    $line .= get_name($id);
+    if ( scalar(@{$$meta->{values}})){
+        $line .= ": ".join(" ", map { $tokens[$_][DATA] } @{$$meta->{values}});
+    } else {
+        $line .= ".*";
+    }
+    return $line;
+}
+
+sub logger {
+    my $type = shift;
+    my $context = shift;
+    my $error = shift;
+    if ( $type >= FATAL ){
+        if ( $context eq 'input' ){
+            help($error);
+        } else {
+            die(log_line($context, $error));
+        }
+    } elsif ( $type == WARN ){
+        warn log_line($context, $error) if WARN >= $OPT{log};
+    } else {
+        print log_line($context, $error) if $type >= $OPT{log};
+    }
+}
+
+sub log_line {
+    my $context = shift;
+    my $error = shift;
+    my $line = "[".strftime("%d/%b/%Y:%H:%M:%S %z", localtime(time()))."] ";
+    $line .= uc($context).": $error\n";
+}
+
+# DATA ACCESS FUNCTIONS
+########################
+
+sub check_if_named_list {
+    my $id = shift;
+    my $meta = get_meta_ref($id);
+    if ( scalar(@{$$meta->{children}}) == 1 &&
+         $tokens[$$meta->{children}->[0]][META]->{type} eq 'list' ){
+
+        $tokens[$id][META]->{named_list} = $$meta->{children}->[0];
+    }
+}
+
+sub get_meta_ref {
+    my $id = defined $_[0] ? shift(@_) : $#tokens;
+    if ( my $meta = shift ){
+        return \$tokens[$id][META]->{$meta};
+    } else {
+        return \$tokens[$id][META];
+    }
+}
+
+sub is_endpoint{
+    return scalar(@{$tokens[$_[0]][META]->{values}}) > 0;
+}
+
+sub get_name {
+    my $id = shift;
+    my $meta = get_meta_ref($id);
+    my @name;
+    foreach my $b_id (@{$$meta->{branch}}){
+        next if $b_id == 0;
+        my $b_meta = get_meta_ref($b_id);
+        push @name, $$b_meta->{name} if $$b_meta->{type} eq 'tuple';
+    }
+    push @name, $$meta->{name} || "[]";
+    return join(".", @name);
+}
+
+sub find_last {
+    return find_last_from($#tokens, @_);
+}
+
+sub find_last_from {
+    my $id = shift;
+    my %query = map { $_ => 1 } @_;
+    until ( exists $query{$tokens[$id][TYPE]} || $id < 0 ) { $id-- }
+    return $id;
+}
+
+sub get_children {
+    my $id = shift;
+    my $meta = get_meta_ref($id);
+    my @children;
+    foreach my $child (@{$$meta->{children}}){
+        my $child_meta = get_meta_ref($child);
+        if ( $$child_meta->{type} eq 'list' ){
+            push @children, get_children($child);
+        } else {
+            push @children, $child;
+        }
+    }
+    return @children;
+}
+
+
+# DATA MODIFICATION FUNCTIONS
+##############################
+
+sub set_action_on_tokens {
+    my $id = shift;
+    my $action = shift;
+    my $meta = get_meta_ref($id);
+    set_action($id, $action);
+    if ( exists $$meta->{end} ){
+        my $start = $id + 1;
+        foreach my $part ($start..$$meta->{end}){
+            set_action($part, $action);
+        }
+        if ( exists $$meta->{comma} ){ 
+            set_action($$meta->{comma}, $action);
+        } else {
+            if ( $$meta->{order} > 1 ){
+                my $parent_meta = get_meta_ref($$meta->{parent});
+                my $older_sibling = get_meta_ref(
+                    $$parent_meta->{children}[$$meta->{order} - 2] # b/c of 0idx
+                );
+                if ( exists $$older_sibling->{comma} ){
+                    set_action($$older_sibling->{comma}, $action);
+                } else {
+                    logger(WARN,'syntax',
+                        "Older sibbling of $id doesn't have a comma:");
+                }
+            }
+        }
+    }
+    
+
+}
+
+sub set_action { $tokens[$_[0]][META]->{action} = $_[1]; }
+
+sub save_arg_to_token {
+    my $id = shift;
+    my $arg = shift;
+    my $type = $tokens[$id][TYPE];
+    my $is_valid = 0;
+    if ( is_of_type($arg, $type) ){
+        $is_valid = 1;
+    } elsif ( $type eq 'text' ){
+        $arg = "\"$arg\"";
+        if ( is_of_type($arg, $type) ){
+            $is_valid = 1;
+        }
+    }
+
+    if ( $is_valid || $OPT{force} ){
+        modify_token_content($id, $arg);
+    } else {
+        warn "Argument $arg does not match expected type of $type\n";
+        die "Use -force to override\n" unless $OPT{force};
+    }
+}
+
+sub modify_token_content {
+    my $id = shift;
+    my $content = shift;
+    $tokens[$id][0] = $content; #BOOM
+    $OPT{write}++;
+}
+
+sub get_token_stream {
+    my $start = shift;
+    my $end = shift || $#tokens;
+    my $offset = $tokens[$start][POS];
+    my $return = "";
+    foreach my $token (@tokens[$start..$end]){
+
+        if ( exists $token->[META]->{action} ){
+            next if $token->[META]->{action} eq 'remove';
+        } else {
+            $return .= $token->[DATA];
+        }
+    }
+    return $return;
+}
+
+sub append_to_token {
+    my $id = shift;
+    my $append = shift;
+    $tokens[$id][0] .= $append; #BOOM
+    $OPT{write}++;
+}
