@@ -1,6 +1,6 @@
-# DESCRIPTION
+# NAME
 
-    Easily parse and modify riak's app.config from the command line.
+    riak-conf - Parse and modify riak's app.config from the command line.
 
 # SYNOPSIS
 
@@ -12,13 +12,13 @@
     -o --output <file>  Specify save location, or use "-" for stdout.
     -a --all            When listing/searching, show all tuples.
     -n --numbers        Add line numbers to list/search output.
-    -f --force          Force, used to overide value type check for modify.
+    -f --force          Force, used to override value type check for modify.
     -d --debug          Set log level to debug.
     -q --quiet          Set log level to suppress usual output.
     --log --loglevel N  Set log level manually to N.
     --diff              Shortcut to display what would be changed.
     --help              Print this help page.
-    --man               Prin more verbose help.
+    --man               Print more verbose help.
 
 ## COMMAND OVERVIEW
     
@@ -87,6 +87,23 @@
         [24/Aug/2012:10:32:09 -0700] DIFF: ---end diff---
         [24/Aug/2012:10:32:09 -0700] SAVING: Changes saved.
 
+# DESCRIPTION
+
+    Easily parse and modify riak's app.config from the command line.
+
+### PURPOSE
+    
+    Riak's app.config is a file containing a list of named tuples in erlang.
+    The only way to change parameters has been by either using a text editor, 
+    regex on specific existing values, or convert to some other form (i.e. JSON)
+    and then back again.
+    
+### REQUIREMENTS
+
+- Simple, command line API
+- No external dependencies ( i.e. Gems, CPAN, etc )
+- Keeps the integrity of the file ( comments, formatting, etc )
+
 # COMMANDS
 
 ## HELP
@@ -132,4 +149,4 @@
     $ riak-conf get <name> [nth] ...
 
         Return the values of parameter <name>, 
-        and optionaly <nth> specific value.
+        and optionally <nth> specific value.
